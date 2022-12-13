@@ -1,18 +1,14 @@
 package pulse
 
 import (
-	"bytes"
 	"context"
-	"encoding/binary"
 	"fmt"
-	"os"
-	"path/filepath"
 	"time"
 
+	"github.com/cg14823/power-down-alarm/mailer"
 	"github.com/cg14823/power-down-alarm/store"
 
 	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
 )
 
 const filePerm = 0644
@@ -24,24 +20,23 @@ type outage struct {
 	end   time.Time
 }
 
-func init() {
-	atom := zap.NewAtomicLevel()
-
-	encoderCfg := zap.NewProductionEncoderConfig()
-	encoderCfg.TimeKey = "timestamp"
-	encoderCfg.EncodeTime = zapcore.ISO8601TimeEncoder
-
-	logger = zap.New(zapcore.NewCore(
-		zapcore.NewJSONEncoder(encoderCfg),
-		zapcore.Lock(os.Stdout),
-		atom,
-	))
-	defer logger.Sync()
+type pulser struct {
+	store     store.OutageStore
+	frequency time.Duration
+	threshold time.Duration
+	mailer    *mailer.Mailer
 }
 
-func StartPulser(ctx context.Context, path, csvPath string, frequency, threshold time.Duration) error {
-	logger.Sugar().Infow("starting pulser", "path", path, "csv", csvPath)
-	outage, err := checkOutage(path, threshold)
+func StartPulser(ctx context.Context, store store.OutageStore, frequency, threshold time.Duration,
+	m *mailer.Mailer, l *zap.Logger) error {
+	logger = l
+	pulser := &pulser{store, frequency, threshold, m}
+	return pulser.start(ctx)
+}
+
+func (p *pulser) start(ctx context.Context) error {
+	logger.Sugar().Infow("starting pulser", "threshold", p.threshold.String(), "frequency", p.frequency.String())
+	outage, err := p.checkOutage()
 	if err != nil {
 		logger.Sugar().Errorw("could not check outage", "err", err)
 		return err
@@ -50,98 +45,57 @@ func StartPulser(ctx context.Context, path, csvPath string, frequency, threshold
 	if outage != nil {
 		logger.Sugar().Infow("recording outage", "start", outage.start.Format(time.RFC3339),
 			"end", outage.end.Format(time.RFC3339))
-		store, err := store.NewCSVOutageStore(csvPath)
+		if p.mailer != nil {
+			p.mailer.AysncOutageNotification(outage.start, outage.end)
+		}
+
+		err := p.store.RecordOutage(outage.start, outage.end)
 		if err != nil {
+			logger.Sugar().Errorw("could not record outage", "err", err)
 			return err
 		}
-
-		err = store.RecordOutage(outage.start, outage.end)
-		if err != nil {
-			logger.Sugar().Errorw("could not record outage", "err", err.Error())
-			return fmt.Errorf("could not record outage: %w", err)
-		}
-
-		store.Close()
 	}
 
-	pulseFile, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, filePerm)
-	if err != nil {
-		logger.Sugar().Errorw("could not create pulse file", "err", err)
-		return err
-	}
-
-	return pulse(ctx, pulseFile, frequency)
+	return p.pulse(ctx)
 }
 
-func checkOutage(filePath string, threshold time.Duration) (*outage, error) {
-	pulseFile, err := os.OpenFile(filePath, os.O_RDONLY, filePerm)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-
-		return nil, err
-	}
-
-	defer func() {
-		pulseFile.Close()
-		os.Remove(filePath)
-	}()
-
-	timeBuf := make([]byte, 10)
-	_, err = pulseFile.Read(timeBuf)
+func (p *pulser) checkOutage() (*outage, error) {
+	last, err := p.store.GetLastPulse()
 	if err != nil {
 		return nil, err
 	}
 
-	lastMod, err := binary.ReadVarint(bytes.NewBuffer(timeBuf))
-	if err != nil {
-		return nil, err
+	if last.IsZero() {
+		return nil, nil
 	}
 
-	lastModTime := time.Unix(lastMod, 0).UTC()
-	logger.Sugar().Infow("last modified", "mod_time", time.Unix(lastMod, 0).Format(time.RFC3339))
-	if time.Now().UTC().Sub(lastModTime) >= threshold {
-		return &outage{lastModTime, time.Now().UTC()}, nil
+	logger.Sugar().Infow("last modified", "mod_time", last.Format(time.RFC3339))
+	if last.After(time.Now().UTC()) {
+		logger.Sugar().Warn("last is larger than current time", "last", last.UTC(), "now", time.Now().UTC())
+		return nil, nil
+	}
+
+	if time.Now().UTC().Sub(last.UTC()) >= p.threshold {
+		return &outage{last, time.Now().UTC()}, nil
 	}
 
 	return nil, nil
 }
 
-func pulse(ctx context.Context, pulseFile *os.File, frequency time.Duration) error {
-	logger.Sugar().Infow("starting pulse", "frequency", frequency.String())
-	ticker := time.NewTicker(frequency)
+func (p *pulser) pulse(ctx context.Context) error {
+	logger.Sugar().Infow("starting pulse", "frequency", p.frequency.String())
+	ticker := time.NewTicker(p.frequency)
 	defer ticker.Stop()
 
-	buf := make([]byte, 10)
 	for {
 		select {
 		case <-ctx.Done():
 			fmt.Println("done")
 			return nil
 		case <-ticker.C:
-			binary.PutVarint(buf, time.Now().UTC().Unix())
-			if _, err := pulseFile.WriteAt(buf, 0); err != nil {
-				logger.Sugar().Errorw("could not right pulse", "err", err.Error())
+			if err := p.store.Pulse(); err != nil {
+				logger.Sugar().Warnw("could not pulse", "err", err)
 			}
-
-			pulseFile.Sync()
 		}
 	}
-}
-
-func getOrCreatePulseFile(path string) (*os.File, bool, error) {
-	absPath, err := filepath.Abs(path)
-	if err != nil {
-		return nil, false, err
-	}
-
-	_, err = os.Stat(absPath)
-	if err != nil && !os.IsNotExist(err) {
-		return nil, false, err
-	}
-
-	created := err != nil
-	pulseFile, err := os.OpenFile(absPath, os.O_CREATE|os.O_WRONLY, os.FileMode(0644))
-	return pulseFile, created, err
 }
